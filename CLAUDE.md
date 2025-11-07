@@ -40,15 +40,43 @@ pip install -r requirements.txt
   --tail_length 2 \
   --port 7860
 
+# With custom resolution (e.g., 720p)
+.venv\scripts\python yolo_rtsp_multi.py \
+  --streams "path/to/video.mp4" \
+  --resolution 1280x720 \
+  --tail_length 2
+
+# With manual recording FPS override (if recordings play at wrong speed)
+.venv\scripts\python yolo_rtsp_multi.py \
+  --streams "path/to/video.mp4" \
+  --fps 25 \
+  --verbose
+
+# Reduce web bandwidth without affecting recording quality
+.venv\scripts\python yolo_rtsp_multi.py \
+  --streams "path/to/video.mp4" \
+  --target_fps 12
+
+# Use both independently (recording 30fps, web stream 12fps)
+.venv\scripts\python yolo_rtsp_multi.py \
+  --streams "path/to/video.mp4" \
+  --fps 30 \
+  --target_fps 12
+
 # Common options:
 # --streams: Space-separated list of RTSP URLs or video file paths
 # --model: YOLO model size (default: yolo11n), e.g., yolov8n, yolov8s
 # --tail_length: Seconds without person to stop recording (default: 2)
 # --confidence: YOLO confidence threshold (default: 0.5)
+# --resolution: Output video resolution, e.g., 1920x1080, 1280x720 (default: original video resolution)
+#
+# FPS options (both independent, both default to source FPS):
+# --fps: Recording FPS override (e.g., 30, 25, 24) - use if saved videos play at wrong speed
+# --target_fps: Web stream FPS (e.g., 12) - lower this to reduce web bandwidth, doesn't affect recordings
+#
 # --auto_delete: Delete clips shorter than 3 seconds
 # --output_dir: Directory to save clips (default: recordings)
 # --port: HTTP server port (default: 7860)
-# --target_fps: MJPEG stream fps (default: 12)
 # --verbose: Show detailed detection stats
 ```
 
@@ -105,13 +133,18 @@ pip install -r requirements.txt
 ## Important Implementation Details
 
 1. **Detection Algorithm**: Uses consecutive frame counting (not sliding window percentage) - stops recording after N consecutive frames without person detection, where N = fps × tail_length
-2. **Thread Safety**: YOLO model predictions use `model_lock` to prevent concurrent inference
-3. **RTSP Reconnection**: Automatic reconnection with 5-second retry interval for RTSP streams
-4. **Frame Queue**: 5-frame buffer (`maxsize=5`) between capture and processing to handle timing differences
-5. **Motion Detection**: Uses Gaussian blur + absolute difference + MSE for motion calculation (though primarily relies on YOLO)
-6. **Timestamp Management**: For file sources, uses frame index and FPS to seek to correct position when starting recording
-7. **Graceful Shutdown**: FastAPI shutdown event ensures all recordings are properly saved
-8. **Countdown Display**: Web overlay shows countdown timer when recording and no person detected
+2. **Custom Resolution**: Use `--resolution` to specify output video size (e.g., 1280x720). Frames are automatically resized during recording. Default: uses original video resolution.
+3. **FPS Control (Independent Parameters)**:
+   - `--fps`: Controls **recording FPS** (default: auto-detect from source). Use if saved videos play at wrong speed.
+   - `--target_fps`: Controls **web stream FPS** (default: auto-detect from source). Lower to reduce bandwidth without affecting recordings.
+   - Both are completely independent and both default to source FPS for smooth playback.
+4. **Thread Safety**: YOLO model predictions use `model_lock` to prevent concurrent inference
+5. **RTSP Reconnection**: Automatic reconnection with 5-second retry interval for RTSP streams
+6. **Frame Queue**: 5-frame buffer (`maxsize=5`) between capture and processing to handle timing differences
+7. **Motion Detection**: Uses Gaussian blur + absolute difference + MSE for motion calculation (though primarily relies on YOLO)
+8. **Timestamp Management**: For file sources, uses frame index and FPS to seek to correct position when starting recording
+9. **Graceful Shutdown**: FastAPI shutdown event ensures all recordings are properly saved
+10. **Countdown Display**: Web overlay shows countdown timer when recording and no person detected
 
 ## Testing/Development Notes
 
@@ -119,3 +152,24 @@ pip install -r requirements.txt
 - Test with video files before RTSP streams to verify setup
 - Use `--verbose` flag to see detailed detection statistics during development
 - The web interface auto-refreshes status every second via JavaScript fetch to `/status`
+
+## Troubleshooting Fast Playback
+
+If saved recordings play back too fast:
+
+1. **Check detected FPS**: Run with `--verbose` and look for `🎬 Detected FPS: X.X`
+2. **Override FPS manually**: Use `--fps` to set the correct playback speed
+
+```bash
+# If recordings play 2x too fast, halve the FPS
+.venv\scripts\python yolo_rtsp_multi.py --streams "video.mp4" --fps 12.5
+
+# Common FPS values to try:
+--fps 24   # Cinema standard
+--fps 25   # PAL video (Europe)
+--fps 30   # NTSC video (USA)
+--fps 15   # Half speed of 30fps
+--fps 12.5 # Half speed of 25fps
+```
+
+3. **Check output message**: After saving, the script shows the FPS used and suggests alternatives if playback is too fast

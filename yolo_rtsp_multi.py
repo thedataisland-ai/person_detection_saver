@@ -34,9 +34,14 @@ parser.add_argument("--auto_delete", default=False, action=BooleanOptionalAction
                     help="Delete clips shorter than 3 seconds.")
 parser.add_argument("--port", default=7860, type=int, help="HTTP port.")
 parser.add_argument("--host", default="0.0.0.0", type=str, help="HTTP host.")
-parser.add_argument("--target_fps", default=12, type=int, help="MJPEG stream fps to clients.")
+parser.add_argument("--target_fps", default=12, type=int,
+                    help="Web MJPEG stream FPS (default: match source FPS). Lower this to reduce web bandwidth.")
 parser.add_argument("--output_dir", type=str, default="recordings",
                     help="Directory to save clips.")
+parser.add_argument("--resolution", type=str, default=None,
+                    help="Output video resolution (e.g., 1920x1080, 1280x720). Default: use original video resolution.")
+parser.add_argument("--fps", type=float, default=None,
+                    help="Recording FPS override (e.g., 30, 25, 24). Default: auto-detect from source. Use if playback speed is wrong.")
 parser.add_argument("--verbose", default=False, action=BooleanOptionalAction,
                     help="Show detailed detection stats.")
 args = parser.parse_args()
@@ -45,6 +50,22 @@ streams = args.streams or ([args.stream] if args.stream else [])
 if not streams:
     sys.exit("❌ Provide --streams <s1> <s2> ... (or --stream <s>)")
 
+# Parse resolution argument
+output_width = None
+output_height = None
+if args.resolution:
+    try:
+        parts = args.resolution.lower().split('x')
+        if len(parts) == 2:
+            output_width = int(parts[0])
+            output_height = int(parts[1])
+            if output_width <= 0 or output_height <= 0:
+                sys.exit(f"❌ Invalid resolution: {args.resolution} (dimensions must be positive)")
+        else:
+            sys.exit(f"❌ Invalid resolution format: {args.resolution} (use format: WIDTHxHEIGHT, e.g., 1920x1080)")
+    except ValueError:
+        sys.exit(f"❌ Invalid resolution: {args.resolution} (use format: WIDTHxHEIGHT, e.g., 1920x1080)")
+
 os.makedirs(args.output_dir, exist_ok=True)
 
 print("="*70)
@@ -52,6 +73,18 @@ print("🎥 Smart Person Detection Recorder")
 print("="*70)
 print(f"📁 Output: {args.output_dir}")
 print(f"🎯 Model: {args.model}.pt | Confidence: {args.confidence}")
+if output_width and output_height:
+    print(f"📐 Recording Resolution: {output_width}x{output_height} (custom)")
+else:
+    print(f"📐 Recording Resolution: Original video resolution")
+if args.fps:
+    print(f"🎬 Recording FPS: {args.fps} (manual override)")
+else:
+    print(f"🎬 Recording FPS: Auto-detect from source")
+if args.target_fps:
+    print(f"📺 Web Stream FPS: {args.target_fps} (manual override)")
+else:
+    print(f"📺 Web Stream FPS: Auto-detect from source (matches recording)")
 print(f"⏱️  Stops recording after {args.tail_length}s without person detection")
 print(f"🚀 Starts IMMEDIATELY on first person detection")
 print(f"👤 Detects ONLY person class (ignores all other objects)")
@@ -68,10 +101,32 @@ def is_rtsp_url(u: str) -> bool:
     return u.startswith("rtsp://") or u.startswith("rtsps://")
 
 def safe_fps(cap) -> float:
-    f = cap.get(cv2.CAP_PROP_FPS) or 0.0
-    if not np.isfinite(f) or f <= 0:
-        return 30.0
-    return float(f)
+    """Try multiple methods to get FPS from video capture"""
+    # Method 1: Standard FPS property
+    f = cap.get(cv2.CAP_PROP_FPS)
+    if f and np.isfinite(f) and f > 0:
+        detected_fps = float(f)
+
+        # Sanity check: warn if FPS seems too high
+        if detected_fps > 60:
+            print(f"⚠️  Warning: Detected very high FPS ({detected_fps:.1f}). This may cause fast playback!")
+            print(f"    If recordings play too fast, use --fps to override (e.g., --fps 25 or --fps 30)")
+
+        return detected_fps
+
+    # Method 2: Try getting frame count and duration
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    if frame_count and frame_count > 0:
+        # Try to estimate from position
+        current_pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+        if current_pos:
+            estimated_fps = (frame_count * 1000.0) / current_pos
+            if estimated_fps > 0 and estimated_fps < 1000:  # Sanity check
+                return float(estimated_fps)
+
+    # Method 3: Common fallback values based on frame count
+    print(f"⚠️  Warning: Could not detect FPS, defaulting to 25.0")
+    return 25.0  # Changed from 30.0 to 25.0 (more common for video files)
 
 def fmt_ts(sec: float) -> str:
     if sec < 0:
@@ -107,7 +162,7 @@ class suppress_stdout_stderr(object):
         self.errnull_file.close()
 
 class CameraWorker:
-    def __init__(self, cam_id: int, source: str):
+    def __init__(self, cam_id: int, source: str, custom_width: int = None, custom_height: int = None, force_fps: float = None):
         self.cam_id = cam_id
         self.source = source
         self.cap = None
@@ -122,7 +177,18 @@ class CameraWorker:
         self.fps = 30.0
         self.period = 1.0 / self.fps
         self.window_size = 0  # Will be calculated based on tail_length
-        
+
+        # Store original video dimensions (will be updated from video)
+        self.original_width = 1920
+        self.original_height = 1080
+
+        # Custom resolution for output (if provided)
+        self.custom_width = custom_width
+        self.custom_height = custom_height
+
+        # Force specific FPS if provided
+        self.force_fps = force_fps
+
         self.recording = False
         self.ffmpeg_proc = None
         self.ffmpeg_thread = None
@@ -133,6 +199,7 @@ class CameraWorker:
         # For file sources, use OpenCV VideoWriter
         self.video_writer = None
         self.writer_lock = threading.Lock()
+        self.frames_written = 0
 
         self.frame_idx = 0
         self.rec_running = False
@@ -154,20 +221,32 @@ class CameraWorker:
         if not self.cap.isOpened():
             print(f"[cam{self.cam_id}] ❌ Unable to open: {self.source}")
             return
-            
-        self.fps = safe_fps(self.cap)
+
+        # Detect FPS from video or use forced FPS
+        if self.force_fps:
+            self.fps = self.force_fps
+            print(f"[cam{self.cam_id}] 🎬 Recording FPS (manual): {self.fps:.1f}")
+        else:
+            detected_fps = safe_fps(self.cap)
+            self.fps = detected_fps
+            print(f"[cam{self.cam_id}] 🎬 Recording FPS (detected): {self.fps:.1f}")
+
         self.period = 1.0 / self.fps
         self.max_no_person_frames = int(self.fps * args.tail_length)  # e.g., 30 fps * 2 sec = 60 frames
 
         ok, img0 = self.cap.read()
         if ok and img0 is not None:
             h, w = img0.shape[:2]
+            # Store original video dimensions for recording
+            self.original_width = w
+            self.original_height = h
+
             self.res = (256, 144) if (w / h) > 1.55 else (216, 162)
             gray = cv2.cvtColor(cv2.resize(img0, self.res), cv2.COLOR_BGR2GRAY)
             self.old_frame = cv2.GaussianBlur(gray, (5, 5), 0)
             self.blank = np.zeros((self.res[1], self.res[0]), np.uint8)
             self.last_bgr = img0
-            print(f"[cam{self.cam_id}] ✅ Ready | FPS: {self.fps:.1f}")
+            print(f"[cam{self.cam_id}] ✅ Ready | Resolution: {w}x{h}")
             print(f"[cam{self.cam_id}] 📊 Will stop recording after {args.tail_length}s ({self.max_no_person_frames} frames) without person")
 
     def _video_ts(self) -> str:
@@ -304,7 +383,27 @@ class CameraWorker:
             if self.recording and not self.is_rtsp and self.video_writer is not None:
                 with self.writer_lock:
                     if self.video_writer and self.video_writer.isOpened():
-                        self.video_writer.write(img)
+                        # Determine target resolution
+                        if self.custom_width and self.custom_height:
+                            target_width = self.custom_width
+                            target_height = self.custom_height
+                        else:
+                            target_width = self.original_width
+                            target_height = self.original_height
+
+                        # Resize frame to match target dimensions
+                        if img.shape[1] != target_width or img.shape[0] != target_height:
+                            resized_frame = cv2.resize(img, (target_width, target_height))
+                            self.video_writer.write(resized_frame)
+                        else:
+                            self.video_writer.write(img)
+
+                        self.frames_written += 1
+
+                        if args.verbose and self.frames_written == 1:
+                            print(f"[cam{self.cam_id}] 📝 Writing frames at {target_width}x{target_height}")
+                        elif args.verbose and self.frames_written % 30 == 0:
+                            print(f"[cam{self.cam_id}] 📝 Written {self.frames_written} frames")
 
             with self.last_lock:
                 self.last_bgr = img
@@ -349,17 +448,50 @@ class CameraWorker:
                 print(f"{start_timestr} [cam{self.cam_id}] ⚠️  Recording started but file not yet created")
         else:
             # For file sources: Use OpenCV VideoWriter to record processed frames
-            fourcc = cv2.VideoWriter_fourcc(*'X264')
-            frame_size = (self.last_bgr.shape[1], self.last_bgr.shape[0]) if self.last_bgr is not None else (1920, 1080)
+            # Change extension to .mp4 for better codec compatibility
+            self.temp_filename = self.temp_filename.replace('.mkv', '.mp4')
 
+            # Try different codecs in order of preference for Windows
+            fourcc_options = [
+                ('mp4v', 'MP4V'),  # MPEG-4
+                ('XVID', 'XVID'),  # Xvid
+                ('MJPG', 'MJPEG'), # Motion JPEG
+            ]
+
+            # Use custom resolution if provided, otherwise use original dimensions
+            if self.custom_width and self.custom_height:
+                frame_size = (self.custom_width, self.custom_height)
+                print(f"{start_timestr} [cam{self.cam_id}] 📐 Using custom resolution: {frame_size[0]}x{frame_size[1]}")
+            else:
+                frame_size = (self.original_width, self.original_height)
+
+            # Use the FPS from the original video
+            recording_fps = self.fps
+
+            print(f"{start_timestr} [cam{self.cam_id}] 🎬 Recording at {recording_fps:.1f} FPS, {frame_size[0]}x{frame_size[1]}")
+
+            writer_created = False
             with self.writer_lock:
-                self.video_writer = cv2.VideoWriter(self.temp_filename, fourcc, self.fps, frame_size)
+                for codec_name, codec_desc in fourcc_options:
+                    fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                    self.video_writer = cv2.VideoWriter(self.temp_filename, fourcc, recording_fps, frame_size)
 
-            if self.video_writer and self.video_writer.isOpened():
+                    if self.video_writer and self.video_writer.isOpened():
+                        print(f"{start_timestr} [cam{self.cam_id}] 📹 Using {codec_desc} codec")
+                        writer_created = True
+                        break
+                    else:
+                        # Try next codec
+                        if self.video_writer:
+                            self.video_writer.release()
+                        self.video_writer = None
+
+            if writer_created:
                 self.rec_running = True
+                self.frames_written = 0
                 print(f"{start_timestr} [cam{self.cam_id}] 🔴 REC START → {self.temp_filename}")
             else:
-                print(f"{start_timestr} [cam{self.cam_id}] ❌ Failed to create VideoWriter")
+                print(f"{start_timestr} [cam{self.cam_id}] ❌ Failed to create VideoWriter with any codec")
                 self.video_writer = None
                 return False
 
@@ -393,12 +525,14 @@ class CameraWorker:
                 th.join(timeout=3.0)
         else:
             # Release VideoWriter for file sources
+            frames_written = self.frames_written
             with self.writer_lock:
                 if self.video_writer is not None:
                     self.video_writer.release()
                     self.video_writer = None
             # Give it a moment to flush to disk
             time.sleep(0.2)
+            print(f"[cam{self.cam_id}] 💾 Wrote {frames_written} frames to disk")
 
         self.temp_filename = None
         self.rec_running = False
@@ -410,10 +544,13 @@ class CameraWorker:
         if old_temp_filename and os.path.isfile(old_temp_filename):
             start_datestr = self.recording_start_time.strftime('%Y-%m-%d')
             start_timestr = self.recording_start_time.strftime('%H-%M-%S')
-            
+
             folder_path = os.path.join(args.output_dir, start_datestr)
-            final_filename = os.path.join(folder_path, 
-                                        f"cam{self.cam_id}_{start_datestr}_{start_timestr}_to_{end_timestr}.mkv")
+
+            # Get file extension from temp filename (could be .mkv for RTSP or .mp4 for files)
+            file_ext = os.path.splitext(old_temp_filename)[1]
+            final_filename = os.path.join(folder_path,
+                                        f"cam{self.cam_id}_{start_datestr}_{start_timestr}_to_{end_timestr}{file_ext}")
             
             file_size = os.path.getsize(old_temp_filename)
             duration = (recording_end_time - self.recording_start_time).total_seconds()
@@ -428,7 +565,8 @@ class CameraWorker:
             else:
                 try:
                     os.rename(old_temp_filename, final_filename)
-                    print(f"{end_timestr} [cam{self.cam_id}] ✅ SAVED: {duration:.1f}s, {file_size/1024/1024:.1f}MB → {final_filename}")
+                    print(f"{end_timestr} [cam{self.cam_id}] ✅ SAVED: {duration:.1f}s, {file_size/1024/1024:.1f}MB @ {self.fps:.1f} FPS")
+                    print(f"{end_timestr} [cam{self.cam_id}]    → {final_filename}")
                     self.filename = final_filename
                 except Exception as e:
                     print(f"[cam{self.cam_id}] ❌ Rename error: {e}")
@@ -457,9 +595,11 @@ class CameraWorker:
         if self.cap:
             self.cap.release()
 
-    def mjpeg_generator(self, target_fps: int = 12):
+    def mjpeg_generator(self, target_fps: int = None):
         boundary = b"--frame"
-        interval = 1.0 / max(1, target_fps)
+        # Use source FPS if target_fps not specified
+        fps = target_fps if target_fps is not None else self.fps
+        interval = 1.0 / max(1, fps)
         next_ts = time.perf_counter()
         while True:
             with self.last_lock:
@@ -475,7 +615,7 @@ class CameraWorker:
             next_ts += interval
 
 
-workers = [CameraWorker(i + 1, s) for i, s in enumerate(streams)]
+workers = [CameraWorker(i + 1, s, output_width, output_height, args.fps) for i, s in enumerate(streams)]
 for w in workers:
     w.start()
 

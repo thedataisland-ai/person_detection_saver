@@ -27,9 +27,7 @@ parser.add_argument("--stream", type=str, help="Single RTSP/file stream (depreca
 parser.add_argument("--model", default="yolo11n", type=str,
                     help="Ultralytics model size (e.g., yolov8n, yolov8s) without .pt")
 parser.add_argument("--tail_length", default=2, type=int, choices=range(1, 30),
-                    help="Seconds without person to STOP recording (uses PERCENTAGE method).")
-parser.add_argument("--person_threshold", default=0.3, type=float,
-                    help="Minimum person detection rate to keep recording (0.0-1.0, default 0.3 = 30%%).")
+                    help="Seconds without person detection to STOP recording.")
 parser.add_argument("--confidence", default=0.5, type=float,
                     help="YOLO confidence threshold (0.0-1.0).")
 parser.add_argument("--auto_delete", default=False, action=BooleanOptionalAction,
@@ -54,7 +52,7 @@ print("🎥 Smart Person Detection Recorder")
 print("="*70)
 print(f"📁 Output: {args.output_dir}")
 print(f"🎯 Model: {args.model}.pt | Confidence: {args.confidence}")
-print(f"⏱️  Stop if <{args.person_threshold*100:.0f}% detection over {args.tail_length}s window")
+print(f"⏱️  Stops recording after {args.tail_length}s without person detection")
 print(f"🚀 Starts IMMEDIATELY on first person detection")
 print(f"👤 Detects ONLY person class (ignores all other objects)")
 print("="*70)
@@ -132,12 +130,17 @@ class CameraWorker:
         self.temp_filename = None
         self.recording_start_time = None
 
+        # For file sources, use OpenCV VideoWriter
+        self.video_writer = None
+        self.writer_lock = threading.Lock()
+
         self.frame_idx = 0
         self.rec_running = False
 
-        # SMART DETECTION: Track recent frames
-        self.detection_window = []  # List of booleans: True = person, False = no person
-        
+        # SMART DETECTION: Track consecutive frames WITHOUT person
+        self.consecutive_no_person = 0  # Counter for frames without person detection
+        self.max_no_person_frames = 0  # Will be calculated: fps * tail_length
+
         self.res = (256, 144)
         self.blank = np.zeros((self.res[1], self.res[0]), np.uint8)
         self.old_frame = None
@@ -154,7 +157,7 @@ class CameraWorker:
             
         self.fps = safe_fps(self.cap)
         self.period = 1.0 / self.fps
-        self.window_size = int(self.fps * args.tail_length)  # e.g., 30 fps * 2 sec = 60 frames
+        self.max_no_person_frames = int(self.fps * args.tail_length)  # e.g., 30 fps * 2 sec = 60 frames
 
         ok, img0 = self.cap.read()
         if ok and img0 is not None:
@@ -164,8 +167,8 @@ class CameraWorker:
             self.old_frame = cv2.GaussianBlur(gray, (5, 5), 0)
             self.blank = np.zeros((self.res[1], self.res[0]), np.uint8)
             self.last_bgr = img0
-            print(f"[cam{self.cam_id}] ✅ Ready | FPS: {self.fps:.1f} | Window: {self.window_size} frames ({args.tail_length}s)")
-            print(f"[cam{self.cam_id}] 📊 Will stop if person detected in <{args.person_threshold*100:.0f}% of last {self.window_size} frames")
+            print(f"[cam{self.cam_id}] ✅ Ready | FPS: {self.fps:.1f}")
+            print(f"[cam{self.cam_id}] 📊 Will stop recording after {args.tail_length}s ({self.max_no_person_frames} frames) without person")
 
     def _video_ts(self) -> str:
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -193,7 +196,7 @@ class CameraWorker:
                             if self.cap.isOpened():
                                 self.fps = safe_fps(self.cap)
                                 self.period = 1.0 / self.fps
-                                self.window_size = int(self.fps * args.tail_length)
+                                self.max_no_person_frames = int(self.fps * args.tail_length)
                                 print(datetime.now().strftime('%H-%M-%S'), f"[cam{self.cam_id}] reconnected.")
                                 break
                             time.sleep(5)
@@ -253,58 +256,55 @@ class CameraWorker:
                         cv2.putText(img, text, (int(xmin), int(ymin) - 5), cv2.FONT_HERSHEY_SIMPLEX,
                                     fontScale=0.7, color=(0, 0, 0), thickness=2)
 
-            # UPDATE DETECTION WINDOW
-            self.detection_window.append(person_detected)
-            if len(self.detection_window) > self.window_size:
-                self.detection_window.pop(0)
-
-            # CALCULATE DETECTION RATE over window
-            if len(self.detection_window) >= self.window_size:
-                person_frames = sum(self.detection_window)
-                detection_rate = person_frames / len(self.detection_window)
+            # TRACK CONSECUTIVE FRAMES WITHOUT PERSON
+            if person_detected:
+                self.consecutive_no_person = 0  # Reset counter when person is detected
             else:
-                detection_rate = 1.0 if person_detected else 0.0
+                self.consecutive_no_person += 1  # Increment when no person
 
             # SMART RECORDING LOGIC
             if not self.recording:
-                # NOT RECORDING - start immediately on first person
+                # NOT RECORDING - start immediately when person is detected
                 if person_detected:
                     self._start_recording()
                     self.recording = True
-                    if args.verbose:
-                        print(f"[cam{self.cam_id}] 🔴 Person detected! Starting recording immediately")
+                    print(f"[cam{self.cam_id}] 🔴 Person detected! Starting recording immediately")
             else:
-                # RECORDING - check if person rate dropped below threshold
-                if len(self.detection_window) >= self.window_size:
-                    if detection_rate < args.person_threshold:
-                        person_frames = sum(self.detection_window)
-                        print(f"[cam{self.cam_id}] 🛑 Person rate dropped to {detection_rate*100:.1f}% ({person_frames}/{len(self.detection_window)} frames)")
-                        print(f"[cam{self.cam_id}] Below threshold of {args.person_threshold*100:.0f}%, stopping recording...")
-                        self._stop_recording()
-                        self.recording = False
-                        self.detection_window = []  # Clear window
-                    elif args.verbose and self.frame_idx % 30 == 0:
-                        person_frames = sum(self.detection_window)
-                        print(f"[cam{self.cam_id}] 📊 Rate: {detection_rate*100:.1f}% ({person_frames}/{len(self.detection_window)}) | Threshold: {args.person_threshold*100:.0f}%")
+                # RECORDING - stop if no person for tail_length seconds
+                if self.consecutive_no_person >= self.max_no_person_frames:
+                    elapsed = self.consecutive_no_person / self.fps
+                    print(f"[cam{self.cam_id}] 🛑 No person detected for {elapsed:.1f}s ({self.consecutive_no_person} frames)")
+                    print(f"[cam{self.cam_id}] Stopping recording and saving clip...")
+                    self._stop_recording()
+                    self.recording = False
+                    self.consecutive_no_person = 0  # Reset counter
+                elif args.verbose and person_detected:
+                    print(f"[cam{self.cam_id}] 👤 Person present (count: {person_count}) - continuing recording")
 
             # OVERLAY INFO
             status = '🔴 REC' if self.recording else '⚪ IDLE'
             person_status = f"Person: {'YES' if person_detected else 'NO'}"
             if person_count > 0:
                 person_status += f" ({person_count})"
-            
-            if self.recording and len(self.detection_window) >= 10:
-                recent_detections = sum(self.detection_window[-30:]) if len(self.detection_window) >= 30 else sum(self.detection_window)
-                recent_total = min(30, len(self.detection_window))
-                recent_rate = (recent_detections / recent_total) * 100
-                person_status += f" | Rate: {recent_rate:.0f}%"
-                
+
+            # Show countdown when recording and no person detected
+            if self.recording and not person_detected and self.consecutive_no_person > 0:
+                remaining_frames = self.max_no_person_frames - self.consecutive_no_person
+                remaining_sec = remaining_frames / self.fps if remaining_frames > 0 else 0
+                person_status += f" | Stopping in: {remaining_sec:.1f}s"
+
             header = f"Cam {self.cam_id} | {status} | {person_status}"
             cv2.putText(img, header, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             ts_text = self._video_ts()
             cv2.putText(img, f"TS: {ts_text}", (10, 48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # Write frame to video file for file sources
+            if self.recording and not self.is_rtsp and self.video_writer is not None:
+                with self.writer_lock:
+                    if self.video_writer and self.video_writer.isOpened():
+                        self.video_writer.write(img)
 
             with self.last_lock:
                 self.last_bgr = img
@@ -314,68 +314,99 @@ class CameraWorker:
     def _start_recording(self):
         if self.recording:
             return False
-            
+
         self.recording_start_time = datetime.now()
         start_datestr = self.recording_start_time.strftime('%Y-%m-%d')
         start_timestr = self.recording_start_time.strftime('%H-%M-%S')
-        
+
         folder_path = os.path.join(args.output_dir, start_datestr)
         os.makedirs(folder_path, exist_ok=True)
-        
+
         self.temp_filename = os.path.join(folder_path, f"cam{self.cam_id}_{start_timestr}_RECORDING.mkv")
 
-        ff = FFmpeg().option("y")
-
         if self.is_rtsp:
+            # For RTSP: Use FFmpeg to copy stream directly
+            ff = FFmpeg().option("y")
             ff = ff.input(self.source, rtsp_transport="tcp")
+            self.ffmpeg_proc = ff.output(self.temp_filename, vcodec="copy", acodec="copy")
+
+            def _run():
+                self.rec_running = True
+                try:
+                    self.ffmpeg_proc.execute()
+                except Exception as e:
+                    print(f"[cam{self.cam_id}] ❌ FFmpeg Error: {e}")
+                finally:
+                    self.rec_running = False
+
+            self.ffmpeg_thread = threading.Thread(target=_run, daemon=True)
+            self.ffmpeg_thread.start()
+            time.sleep(0.5)  # Wait for FFmpeg to initialize
+
+            if os.path.isfile(self.temp_filename):
+                print(f"{start_timestr} [cam{self.cam_id}] 🔴 REC START → {self.temp_filename}")
+            else:
+                print(f"{start_timestr} [cam{self.cam_id}] ⚠️  Recording started but file not yet created")
         else:
-            now_sec = self.frame_idx / max(1e-6, self.fps)
-            ff = ff.option("re").input(self.source, ss=fmt_ts(now_sec))
+            # For file sources: Use OpenCV VideoWriter to record processed frames
+            fourcc = cv2.VideoWriter_fourcc(*'X264')
+            frame_size = (self.last_bgr.shape[1], self.last_bgr.shape[0]) if self.last_bgr is not None else (1920, 1080)
 
-        self.ffmpeg_proc = ff.output(self.temp_filename, vcodec="copy", acodec="copy")
+            with self.writer_lock:
+                self.video_writer = cv2.VideoWriter(self.temp_filename, fourcc, self.fps, frame_size)
 
-        def _run():
-            self.rec_running = True
-            try:
-                self.ffmpeg_proc.execute()
-            except Exception as e:
-                if args.verbose:
-                    print(f"[cam{self.cam_id}] FFmpeg: {e}")
-            finally:
-                self.rec_running = False
+            if self.video_writer and self.video_writer.isOpened():
+                self.rec_running = True
+                print(f"{start_timestr} [cam{self.cam_id}] 🔴 REC START → {self.temp_filename}")
+            else:
+                print(f"{start_timestr} [cam{self.cam_id}] ❌ Failed to create VideoWriter")
+                self.video_writer = None
+                return False
 
-        self.ffmpeg_thread = threading.Thread(target=_run, daemon=True)
-        self.ffmpeg_thread.start()
-        print(f"{start_timestr} [cam{self.cam_id}] 🔴 REC START → {self.temp_filename}")
         return True
 
     def _stop_recording(self):
         if not self.recording and not self.rec_running:
             return
-            
+
         recording_end_time = datetime.now()
         end_timestr = recording_end_time.strftime('%H-%M-%S')
 
-        proc = self.ffmpeg_proc
-        th = self.ffmpeg_thread
         old_temp_filename = self.temp_filename
 
-        self.ffmpeg_proc = None
-        self.ffmpeg_thread = None
+        if self.is_rtsp:
+            # Stop FFmpeg for RTSP sources
+            proc = self.ffmpeg_proc
+            th = self.ffmpeg_thread
+
+            self.ffmpeg_proc = None
+            self.ffmpeg_thread = None
+
+            if proc and self.rec_running:
+                try:
+                    proc.terminate()
+                except Exception as e:
+                    if "not executed" not in str(e).lower() and args.verbose:
+                        print(f"[cam{self.cam_id}] terminate error: {e}")
+
+            if th and th.is_alive():
+                th.join(timeout=3.0)
+        else:
+            # Release VideoWriter for file sources
+            with self.writer_lock:
+                if self.video_writer is not None:
+                    self.video_writer.release()
+                    self.video_writer = None
+            # Give it a moment to flush to disk
+            time.sleep(0.2)
+
         self.temp_filename = None
-
-        if proc and self.rec_running:
-            try:
-                proc.terminate()
-            except Exception as e:
-                if "not executed" not in str(e).lower() and args.verbose:
-                    print(f"[cam{self.cam_id}] terminate error: {e}")
-
-        if th and th.is_alive():
-            th.join(timeout=3.0)
-
         self.rec_running = False
-        
+
+        # Wait a bit for file to be created if it doesn't exist yet
+        if old_temp_filename and not os.path.isfile(old_temp_filename):
+            time.sleep(0.5)
+
         if old_temp_filename and os.path.isfile(old_temp_filename):
             start_datestr = self.recording_start_time.strftime('%Y-%m-%d')
             start_timestr = self.recording_start_time.strftime('%H-%M-%S')
@@ -477,7 +508,7 @@ img { width:100%; border-radius:8px; background:#000; }
 <body>
   <div class="header">
     <h1>🎥 Smart Person Detection</h1>
-    <p>Starts immediately • Only detects person • Stops when detection rate drops</p>
+    <p>Starts immediately • Only detects person • Stops after 2s without person</p>
   </div>
   <div class="grid">
   %CARDS%
@@ -528,7 +559,7 @@ def _card(i):
       <div class="status" id="status-{i}">
         <div class="status-item"><span>Status:</span><span>Initializing...</span></div>
       </div>
-      <small>Person-only detection • Rate shown on overlay</small>
+      <small>Person-only detection • Countdown shown when stopping</small>
     </div>
     """
 
